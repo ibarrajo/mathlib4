@@ -6,8 +6,7 @@ Authors: Xavier Généreux, María Inés de Frutos-Fernández
 module
 
 public import Mathlib.Algebra.Algebra.Defs
-public import Mathlib.Algebra.SkewMonoidAlgebra.Single
-public import Mathlib.Algebra.SkewMonoidAlgebra.Support
+public import Mathlib.Algebra.SkewMonoidAlgebra.Basic
 /-!
 # Univariate skew polynomials
 

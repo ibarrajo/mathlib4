@@ -13,6 +13,7 @@ public import Mathlib.Algebra.GroupWithZero.Semiconj
 public import Mathlib.Data.Set.Operations
 public import Mathlib.Order.Basic
 public import Mathlib.Order.Bounds.Defs
+public import Std.Tactic.BVDecide.Normalize
 
 /-!
 # Extended GCD and divisibility over ℤ
