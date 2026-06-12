@@ -634,13 +634,6 @@ jobs:
       - name: 'Setup jq'
         uses: dcarbone/install-jq-action@b7ef57d46ece78760b4019dbc4080a1ba2a40b45 # v3.2.0
 
-      # Checkout a trusted branch to build the tooling from (shallow: default depth 1).
-      - name: Checkout tools branch
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          ref: ${{ inputs.tools_branch_ref != '' && inputs.tools_branch_ref || (github.repository == 'leanprover-community/mathlib4-nightly-testing' && 'nightly-testing-green' || 'master') }}
-          path: tools-branch
-
       - name: Checkout local actions
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -650,12 +643,15 @@ jobs:
           path: workflow-actions
 
       # See the build job for why this `uses:` step is duplicated.
+      # In this job, mathlib-ci (CI_SCRIPTS_DIR) is only consumed by the
+      # lean-pr-testing comments step at the end, which runs only on the
+      # nightly-testing repository — so skip the checkout everywhere else.
       - name: Get mathlib-ci
-        if: ${{ inputs.mathlib_ci_ref == '' }}
+        if: ${{ github.repository == 'leanprover-community/mathlib4-nightly-testing' && inputs.mathlib_ci_ref == '' }}
         uses: ./workflow-actions/.github/actions/get-mathlib-ci
 
       - name: Get mathlib-ci
-        if: ${{ inputs.mathlib_ci_ref != '' }}
+        if: ${{ github.repository == 'leanprover-community/mathlib4-nightly-testing' && inputs.mathlib_ci_ref != '' }}
         uses: ./workflow-actions/.github/actions/get-mathlib-ci
         with:
           ref: ${{ inputs.mathlib_ci_ref }}
@@ -687,17 +683,6 @@ jobs:
           # This is an untrusted (potentially fork) checkout whose code we build.
           # Don't leave the GITHUB_TOKEN in pr-branch/.git/config, where that code could read it.
           persist-credentials: false
-
-      - name: Prepare DownstreamTest directory
-        shell: bash
-        run: |
-          echo "Copying lean-toolchain to DownstreamTest..."
-          cd pr-branch
-          # Ensure DownstreamTest/.lake/ directory exists, since landrun will need it later
-          mkdir -p DownstreamTest/.lake/
-          cd DownstreamTest
-          cp ../lean-toolchain .
-          echo "lean-toolchain copied successfully to DownstreamTest."
 
       # Create empty directories so landrun doesn't complain
       - name: Create empty directories
@@ -759,14 +744,16 @@ jobs:
           # Set it as an environment variable for subsequent steps
           echo "LEAN_SRC_PATH=$LEAN_SRC_PATH" >> "$GITHUB_ENV"
 
-      - name: build tools-branch tools
-        shell: bash # We're only building a trusted branch with the tools, so no need to run inside landrun.
-        run: |
-          cd tools-branch
-          # test_lint only needs the `cache` binary (to fetch oleans). The
-          # `test`/`lint` drivers come from the PR branch's own lake config.
-          lake build cache
-          ls .lake/build/bin/cache
+      # Populate `tools-branch/` exactly as in the `build` job (see the comment
+      # there): prebuilt `tools-bin` artifact on the common path, source build
+      # otherwise. This job uses the `cache` binary and `lake-build-wrapper.py`
+      # from it; the `test`/`lint` drivers come from the PR branch's own lake config.
+      - name: Get CI tools
+        uses: ./workflow-actions/.github/actions/get-tools
+        with:
+          use_artifact: ${{ inputs.tools_branch_ref == '' && github.repository == 'leanprover-community/mathlib4' }}
+          tools_source_ref: ${{ inputs.tools_branch_ref != '' && inputs.tools_branch_ref || (github.repository == 'leanprover-community/mathlib4-nightly-testing' && 'nightly-testing-green' || 'master') }}
+          github_token: ${{ github.token }}
 
       - name: download dependencies
         # We need network access to download dependencies
