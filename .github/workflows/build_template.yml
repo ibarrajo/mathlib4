@@ -51,6 +51,7 @@ jobs:
       archive-outcome: ${{ steps.archive.outcome }}
       counterexamples-outcome: ${{ steps.counterexamples.outcome }}
       cache-staging-has-files: ${{ steps.cache_staging_check.outputs.has_files }}
+      full-cache-outcome: ${{ steps.upload_full_cache.outcome }}
       get-cache-outcome: ${{ steps.get.outcome }}
       mk_all-outcome: ${{ steps.mk_all.outcome }}
       noisy-outcome: ${{ steps.noisy.outcome }}
@@ -539,6 +540,29 @@ jobs:
           name: cache-staging
           path: cache-staging/
 
+      # The runners are ephemeral, so at this point `~/.cache/mathlib` holds the
+      # complete `.ltar` set for this commit: everything `cache get` downloaded
+      # into the (initially empty) directory, plus everything the stage steps
+      # packed. Ship the whole set to `test_lint` as an artifact so its `cache
+      # get` resolves entirely from local files: GitHub artifact transfer is
+      # free for public repositories, whereas every fetch from the Azure cache
+      # is paid egress. Authors and reviewers are unaffected -- `upload_cache`
+      # still publishes the staged files to Azure for `lake exe cache get`.
+      # Skipped on cancellation (unlike the stage steps): `test_lint` doesn't
+      # run on a cancelled build, so the multi-GB upload would be wasted.
+      - name: upload full cache artifact
+        id: upload_full_cache
+        if: ${{ always() && (steps.build.outcome == 'success' || steps.build.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: full-cache
+          path: /home/lean/.cache/mathlib/*.ltar
+          # The `.ltar` files are already zstd-compressed; recompressing wastes CPU.
+          compression-level: 0
+          # Only `test_lint` (in this same run) consumes this artifact, so the
+          # default retention would just hold gigabytes per run for no reader.
+          retention-days: 1
+
       - name: Check if building Archive or Counterexamples failed
         if: steps.archive.outcome == 'failure' || steps.counterexamples.outcome == 'failure'
         run: |
@@ -562,26 +586,28 @@ jobs:
 
   test_lint:
     name: Test and lint
-    needs: [build, upload_cache]
+    needs: [build]
     # `test` and `lint` were peeled out of the `build` job. They run on the SAME
-    # self-hosted pool, but as a separate job they start once the freshly-built
-    # oleans are in the cache -- IN PARALLEL with `post_steps`. That's the whole
-    # point: the GitHub-hosted post-build chain (upload_cache -> post_steps) no
-    # longer waits behind the ~300s test+lint tail, cutting the typical end-to-end
-    # wait. The cost is one re-paid setup+cache-fetch prefix (this job is a fresh
+    # self-hosted pool, but as a separate job they start as soon as `build`
+    # finishes -- IN PARALLEL with the GitHub-hosted post-build chain
+    # (upload_cache -> post_steps), which no longer waits behind the ~300s
+    # test+lint tail. The cost is one re-paid setup prefix (this job is a fresh
     # runner) and no increase in per-run PEAK pool concurrency (build and
-    # test_lint run sequentially on the pool; the overlapped work is on free
-    # GitHub-hosted runners).
+    # test_lint run sequentially on the pool).
     #
-    # Gating: run when the build job SUCCEEDED or FAILED (not cancelled/skipped),
-    # and upload_cache succeeded or was skipped. We deliberately run on build
+    # This job does NOT depend on `upload_cache`: it sources this run's oleans
+    # from the `full-cache` artifact uploaded by `build` (see that step for the
+    # cost rationale), not from the Azure cache, so it neither waits for the
+    # Azure upload nor re-downloads from paid storage.
+    #
+    # Gating: run when the build job SUCCEEDED or FAILED (not cancelled/skipped)
+    # and the full-cache artifact was uploaded. We deliberately run on build
     # FAILURE too, to preserve the old monolith's behavior of still reporting
-    # `lint` results on a failed build (best-effort, on whatever oleans the cache
-    # has). The individual `test`/`lint` steps below reproduce the monolith's
+    # `lint` results on a failed build (best-effort, on whatever oleans were
+    # built). The individual `test`/`lint` steps below reproduce the monolith's
     # per-step conditions: `test` only on a clean build, `lint` on success-or-
-    # failure. (upload_cache skipped == a warm run with no new oleans to upload;
-    # the existing cache is then already complete, so `cache get` still works.)
-    if: ${{ always() && (needs.build.result == 'success' || needs.build.result == 'failure') && (needs.upload_cache.result == 'success' || needs.upload_cache.result == 'skipped') }}
+    # failure.
+    if: ${{ always() && (needs.build.result == 'success' || needs.build.result == 'failure') && needs.build.outputs.full-cache-outcome == 'success' }}
     runs-on: ${{ inputs.runs_on }}
     outputs:
       lint-outcome: ${{ steps.lint.outcome }}
@@ -636,6 +662,20 @@ jobs:
         uses: ./workflow-actions/.github/actions/get-mathlib-ci
         with:
           ref: ${{ inputs.mathlib_ci_ref }}
+
+      # Same trust dispatch as in the `build` and `post_steps` jobs, loaded from
+      # the trust-rooted `workflow-actions/` checkout. In the happy path the
+      # `cache get` below resolves everything from the unpacked `full-cache`
+      # artifact and never touches the network; this dispatch exists so that any
+      # FALLBACK download (a file unexpectedly missing from the artifact) uses
+      # the same trust-classified read chain and per-commit scope as every other
+      # cache read in this workflow.
+      - name: Compute cache trust dispatch
+        uses: ./workflow-actions/.github/actions/cache-trust-dispatch
+        with:
+          repo: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          branch: ${{ github.head_ref || github.ref_name }}
+          head-sha: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # Checkout the PR branch into a subdirectory.
       - name: Checkout PR branch
@@ -739,20 +779,32 @@ jobs:
           cd pr-branch
           lake env
 
-      - name: get cache (fetch this run's freshly-built oleans)
+      # Populate the (empty, ephemeral) local cache directory with the complete
+      # `.ltar` set the build job assembled for this commit, so the `cache get`
+      # below resolves from local files instead of re-downloading ~the whole
+      # cache from paid Azure storage. The artifact's contents are byte-identical
+      # to what `cache get` would fetch: the same files the build job downloaded
+      # plus the ones it packed (which `upload_cache` publishes to Azure).
+      - name: download full cache artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: full-cache
+          path: /home/lean/.cache/mathlib
+
+      - name: get cache (unpack this run's oleans)
         shell: bash # only runs `cache get` from the trusted tools-branch, so doesn't need to be inside landrun
         env:
           CACHE_REPO: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
         run: |
           cd pr-branch
-          echo "Removing old Mathlib build directories prior to cache fetch..."
+          echo "Removing old Mathlib build directories prior to cache unpack..."
           rm -rf .lake/build/lib/lean/Mathlib
-          # `upload_cache` has already pushed this run's oleans to Azure (or, on a
-          # warm run, it was skipped because nothing changed and the cache is
-          # already complete), so a plain `cache get` retrieves the full set --
-          # no parent-commit warmup needed (that is the build job's concern).
+          # The full-cache artifact has pre-populated `~/.cache/mathlib`, so this
+          # decompresses local files and only downloads (via the trust-dispatch
+          # read chain in env) anything unexpectedly missing -- no parent-commit
+          # warmup needed (that is the build job's concern).
           ../tools-branch/.lake/build/bin/cache get
-          # Run again with --repo, to ensure we actually get the oleans.
+          # Run again with --repo, as a fallback to ensure we actually get the oleans.
           ../tools-branch/.lake/build/bin/cache --repo="$CACHE_REPO" get
 
       - name: verify the Mathlib cache is complete
